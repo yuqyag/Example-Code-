@@ -1,0 +1,128 @@
+# ============================================================
+# Unsupervised Customer Segmentation via RFM Model
+# "Segmenting Bank Customers via RFM Model and Unsupervised Machine Learning"
+# ============================================================
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
+from scipy.cluster.hierarchy import dendrogram, linkage
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Load your data
+df = pd.read_csv("transactions.csv")
+
+df.columns = ['Card_Holder', 'Transaction_ID', 'Amount', 'OP_Date_Precise']
+
+df['OP_Date_Precise'] = pd.to_datetime(df['OP_Date_Precise'])
+df['Amount'] = df['Amount'].astype(float)
+
+# RFM Featuring
+
+snapshot_date = df['OP_Date_Precise'].max() + pd.Timedelta(days=1)
+
+rfm = df.groupby('Card_Holder').agg({
+    'OP_Date_Precise': lambda x: (snapshot_date - x.max()).days,  # Recency
+    'Transaction_ID': 'count',                                   # Frequency
+    'Amount': 'sum'                                              # Monetary
+}).reset_index()
+
+rfm.columns = ['Card_Holder', 'Recency', 'Frequency', 'Monetary']
+
+# Data Preprocessing
+
+# Handle missing values
+rfm = rfm.fillna(rfm.mean())
+
+# Standardization
+scaler = StandardScaler()
+rfm_scaled = scaler.fit_transform(rfm[['Recency', 'Frequency', 'Monetary']])
+rfm_scaled = pd.DataFrame(rfm_scaled, columns=['Recency', 'Frequency', 'Monetary'])
+
+# K-Means 
+
+# Determine optimal clusters using the Elbow Method
+wcss = []
+for i in range(1, 11):
+    kmeans = KMeans(n_clusters=i, random_state=42)
+    kmeans.fit(rfm_scaled)
+    wcss.append(kmeans.inertia_)
+
+plt.plot(range(1, 11), wcss, marker='o')
+plt.title('Elbow Method')
+plt.xlabel('Number of clusters')
+plt.ylabel('WCSS')
+plt.show()
+
+# Build K-Means model with optimal cluster (e.g., 4)
+kmeans = KMeans(n_clusters=4, random_state=42)
+rfm['KMeans_Cluster'] = kmeans.fit_predict(rfm_scaled)
+
+# Re-cluster the most heterogeneous cluster (e.g., cluster 0)
+subset = rfm[rfm['KMeans_Cluster'] == 0]
+subset_scaled = scaler.fit_transform(subset[['Recency', 'Frequency', 'Monetary']])
+kmeans_refine = KMeans(n_clusters=2, random_state=42)
+subset['Refined_Cluster'] = kmeans_refine.fit_predict(subset_scaled)
+
+# Merge refined clusters
+rfm.loc[subset.index, 'KMeans_Cluster'] = subset['Refined_Cluster'] + 10  # offset to distinguish
+
+# Visualize K-Means clusters
+sns.pairplot(rfm, hue='KMeans_Cluster', vars=['Recency', 'Frequency', 'Monetary'], palette='tab10')
+plt.suptitle("K-Means ➜ K-Means Clusters", y=1.02)
+plt.show()
+
+# Model 2 — DBSCAN ➜、
+dbscan = DBSCAN(eps=0.8, min_samples=5)
+rfm['DBSCAN_Cluster'] = dbscan.fit_predict(rfm_scaled)
+
+# Identify outliers
+outliers = rfm[rfm['DBSCAN_Cluster'] == -1]
+
+
+# Apply K-Means to outliers
+if not outliers.empty:
+    outliers_scaled = scaler.fit_transform(outliers[['Recency', 'Frequency', 'Monetary']])
+    kmeans_outliers = KMeans(n_clusters=2, random_state=42)
+    outliers['Outlier_Cluster'] = kmeans_outliers.fit_predict(outliers_scaled)
+    rfm.loc[outliers.index, 'DBSCAN_Cluster'] = outliers['Outlier_Cluster'] + 10
+
+# Visualize DBSCAN results
+sns.pairplot(rfm, hue='DBSCAN_Cluster', vars=['Recency', 'Frequency', 'Monetary'], palette='tab20')
+plt.suptitle("DBSCAN ➜ K-Means Clusters", y=1.02)
+plt.show()
+
+# Agglomerative (Hierarchical) Clustering
+link = linkage(rfm_scaled, method='ward')
+plt.figure(figsize=(10, 5))
+dendrogram(link)
+plt.title('Hierarchical Clustering Dendrogram')
+plt.xlabel('Customers')
+plt.ylabel('Distance')
+plt.show()
+
+# Build Agglomerative model (e.g., n_clusters=4)
+agg = AgglomerativeClustering(n_clusters=4)
+rfm['Hierarchical_Cluster'] = agg.fit_predict(rfm_scaled)
+
+# Visualize Hierarchical Clusters
+sns.pairplot(rfm, hue='Hierarchical_Cluster', vars=['Recency', 'Frequency', 'Monetary'], palette='Set2')
+plt.suptitle("Hierarchical Clustering Results", y=1.02)
+plt.show()
+
+#Cluster Profiling
+def profile_clusters(df, cluster_col):
+    profile = df.groupby(cluster_col).agg({
+        'Recency': 'mean',
+        'Frequency': 'mean',
+        'Monetary': ['mean', 'count']
+    }).round(2)
+    profile.columns = ['Recency_mean', 'Frequency_mean', 'Monetary_mean', 'Count']
+    return profile
+
+print("\nK-Means Cluster Profile:\n", profile_clusters(rfm, 'KMeans_Cluster'))
+print("\nDBSCAN Cluster Profile:\n", profile_clusters(rfm, 'DBSCAN_Cluster'))
+print("\nHierarchical Cluster Profile:\n", profile_clusters(rfm, 'Hierarchical_Cluster'))
