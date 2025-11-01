@@ -1,0 +1,330 @@
+
+
+import numpy as np
+from sklearn import datasets
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from typing import List, Tuple
+
+
+
+# Utilities / Seed
+
+RNG = np.random.RandomState(42)
+
+
+# Activations
+
+class ReLU:
+    @staticmethod
+    def forward(Z: np.ndarray) -> np.ndarray:
+        return np.maximum(0, Z)
+
+    @staticmethod
+    def backward(dA: np.ndarray, Z: np.ndarray) -> np.ndarray:
+        dZ = dA.copy()
+        dZ[Z <= 0] = 0
+        return dZ
+
+
+class Softmax:
+    @staticmethod
+    def forward(Z: np.ndarray) -> np.ndarray:
+        # Numerically stable softmax along rows
+        z_shift = Z - np.max(Z, axis=1, keepdims=True)
+        exp_z = np.exp(z_shift)
+        probs = exp_z / np.sum(exp_z, axis=1, keepdims=True)
+        return probs
+
+    # Note: We'll use combined softmax + cross-entropy derivative in loss.backward for efficiency.
+
+
+
+# Loss: Categorical Cross-Entropy
+
+class CategoricalCrossEntropy:
+    @staticmethod
+    def loss(probs: np.ndarray, y_true: np.ndarray) -> float:
+        """
+        probs: (m, C) predicted probabilities
+        y_true: (m, C) one-hot true labels
+        returns average loss (scalar)
+        """
+        m = probs.shape[0]
+        # Clip for numerical stability
+        clipped = np.clip(probs, 1e-12, 1.0)
+        log_likelihood = -np.sum(y_true * np.log(clipped), axis=1)
+        return np.mean(log_likelihood)
+
+    @staticmethod
+    def gradient(probs: np.ndarray, y_true: np.ndarray) -> np.ndarray:
+        """
+        derivative of loss wrt pre-softmax logits when using softmax followed by cross-entropy:
+        dZ = (probs - y_true) / m
+        """
+        m = probs.shape[0]
+        return (probs - y_true) / m
+
+# Dense Layer
+class Dense:
+    def __init__(self, in_units: int, out_units: int, weight_scale: float = 0.01, use_bias: bool = True):
+        # Heuristic init: small random normal
+        self.W = RNG.randn(in_units, out_units) * weight_scale
+        self.b = np.zeros((1, out_units)) if use_bias else None
+
+        # Cache for backprop
+        self.X = None
+        self.Z = None  # pre-activation
+        self.dW = None
+        self.db = None
+
+    def forward(self, X: np.ndarray) -> np.ndarray:
+        """
+        X: (m, in_units)
+        returns Z = X @ W + b
+        """
+        self.X = X
+        Z = X.dot(self.W)
+        if self.b is not None:
+            Z += self.b
+        self.Z = Z
+        return Z
+
+    def backward(self, dZ: np.ndarray) -> np.ndarray:
+        """
+        dZ: (m, out_units) upstream gradient w.r.t. pre-activation
+        returns dX: gradient w.r.t. inputs (m, in_units)
+        also sets self.dW and self.db for parameter update
+        """
+        m = self.X.shape[0]
+        self.dW = self.X.T.dot(dZ)  # (in_units, out_units)
+        if self.b is not None:
+            self.db = np.sum(dZ, axis=0, keepdims=True)
+        dX = dZ.dot(self.W.T)
+        return dX
+
+    def update_params(self, lr: float):
+        self.W -= lr * self.dW
+        if self.b is not None:
+            self.b -= lr * self.db
+
+
+# MLP Network
+class MLP:
+    def __init__(self, layers: List[Tuple[str, object]]):
+        """
+        layers: list of tuples ('name', layer_or_activation)
+        e.g. [('dense1', Dense(...)), ('relu1', ReLU), ('dense2', Dense(...)), ('softmax', Softmax)]
+        Activation entries are classes with forward/backward static methods as defined above.
+        """
+        self.layers = layers
+
+    def forward(self, X: np.ndarray) -> np.ndarray:
+        out = X
+        for name, layer in self.layers:
+            if isinstance(layer, Dense):
+                out = layer.forward(out)
+            elif layer is ReLU:
+                # ReLU expects pre-activation Z from previous Dense; we store Z inside the Dense layer
+                # To keep design simple, call ReLU.forward with the Dense.Z we just set in that layer.
+                # But since we only have the Z inside the latest Dense, we assume a pattern: Dense -> Activation -> Dense -> ...
+                # So we call ReLU.forward on the last Dense.Z
+                # Find preceding Dense layer's Z (the last Dense before this activation)
+                # Simpler: we allow activation layers to accept the last computed 'out' (which for ReLU should be Z)
+                out = ReLU.forward(out)
+            elif layer is Softmax:
+                out = Softmax.forward(out)
+            else:
+                raise ValueError(f"Unknown layer type for {name}")
+        return out
+
+    def backward(self, probs: np.ndarray, y_true: np.ndarray):
+        """
+        Backpropagate the gradient from loss:
+        - Use gradient from combined softmax+cross-entropy as dZ at the final pre-softmax layer.
+        - We must traverse layers backwards, applying backward rules for activations and Dense layers.
+        """
+        # compute dA (gradient w.r.t. the input to the final layer's activation)
+        dA = CategoricalCrossEntropy.gradient(probs, y_true)  # this represents dZ for the pre-softmax logits
+
+        # We'll go backward through the layers list, handling Dense and activations
+        # but our forward implementation applied activations immediately after Dense,
+        # so during backward we need to invert that.
+
+        # We'll maintain a pointer to dA which is gradient w.r.t current 'activation input'.
+        # iterate reversed
+        for name, layer in reversed(self.layers):
+            if layer is Softmax:
+                # Already used combined derivative; nothing extra to do for softmax layer entry
+                # The incoming dA is actually dZ at pre-softmax, so we simply continue.
+                continue
+            elif layer is ReLU:
+                # For ReLU we need the pre-activation Z of the Dense layer BEFORE it.
+                # For simplicity, assume previous layer is a Dense (common pattern).
+                # Find the preceding Dense layer (the next in reversed order)
+                # But we can use the output Z stored in that Dense layer if the architecture is Dense->ReLU
+                # So here dA represents gradient wrt ReLU output; we need to compute dZ = dA * ReLU'(Z)
+                # We need the Z used for this ReLU. Find the first Dense layer encountered after this ReLU in reversed order.
+                # Implementation approach: look ahead in reversed list to find the first Dense instance and access its Z.
+                # Build a temporary index list to find it.
+                # (This is a bit hacky but keeps layer representation simple)
+                # find Z by searching forward in reversed list (i.e., lower indices)
+                # We'll search self.layers for the nearest Dense preceding this ReLU in forward order.
+                # Get index of current layer in forward order:
+                idx = None
+                for i, (n, l) in enumerate(self.layers):
+                    if n == name:
+                        idx = i
+                        break
+                # find previous Dense (index idx-1 or earlier)
+                prev_dense_Z = None
+                for j in range(idx - 1, -1, -1):
+                    if isinstance(self.layers[j][1], Dense):
+                        prev_dense_Z = self.layers[j][1].Z
+                        break
+                if prev_dense_Z is None:
+                    raise RuntimeError("ReLU backward: couldn't find preceding Dense layer to obtain Z.")
+                dA = ReLU.backward(dA, prev_dense_Z)
+            elif isinstance(layer, Dense):
+                # Dense.backward expects dZ (gradient w.r.t. pre-activation).
+                # But here dA is gradient w.r.t. the Dense output (i.e., pre-activation if activation comes after or post-act if none).
+                # For standard pattern Dense -> Activation, after activation backward returns gradient w.r.t Dense pre-activation.
+                # So at this point dA should be dZ for Dense.backward (consistent).
+                dA = layer.backward(dA)
+            else:
+                raise ValueError(f"Unknown layer in backward pass: {name}")
+
+    def update_params(self, lr: float):
+        # Update all Dense layers
+        for name, layer in self.layers:
+            if isinstance(layer, Dense):
+                layer.update_params(lr)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        probs = self.forward(X)
+        return np.argmax(probs, axis=1)
+
+
+# Helper functions
+def one_hot(y: np.ndarray, num_classes: int) -> np.ndarray:
+    m = y.shape[0]
+    oh = np.zeros((m, num_classes))
+    oh[np.arange(m), y] = 1
+    return oh
+
+
+def accuracy(y_pred: np.ndarray, y_true: np.ndarray) -> float:
+    return np.mean(y_pred == y_true)
+
+
+# Training loop
+def train(
+    model: MLP,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    epochs: int = 200,
+    lr: float = 0.1,
+    batch_size: int = 16,
+    verbose: bool = True
+):
+    m = X_train.shape[0]
+    num_batches = int(np.ceil(m / batch_size))
+
+    for epoch in range(1, epochs + 1):
+        # Shuffle training set
+        perm = RNG.permutation(m)
+        X_shuffled = X_train[perm]
+        y_shuffled = y_train[perm]
+
+        for b in range(num_batches):
+            start = b * batch_size
+            end = start + batch_size
+            X_batch = X_shuffled[start:end]
+            y_batch = y_shuffled[start:end]
+
+            # Forward
+            probs = model.forward(X_batch)
+
+            # Backward (compute gradients)
+            model.backward(probs, y_batch)
+
+            # Update parameters
+            model.update_params(lr)
+
+        # End of epoch: evaluate
+        train_probs = model.forward(X_train)
+        train_loss = CategoricalCrossEntropy.loss(train_probs, y_train)
+        train_preds = np.argmax(train_probs, axis=1)
+        train_labels = np.argmax(y_train, axis=1)
+        train_acc = accuracy(train_preds, train_labels)
+
+        val_probs = model.forward(X_val)
+        val_loss = CategoricalCrossEntropy.loss(val_probs, y_val)
+        val_preds = np.argmax(val_probs, axis=1)
+        val_labels = np.argmax(y_val, axis=1)
+        val_acc = accuracy(val_preds, val_labels)
+
+        if verbose and (epoch % 10 == 0 or epoch == 1 or epoch == epochs):
+            print(f"Epoch {epoch:3d} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+
+
+
+# Main: Prepare data, build model, train
+def main():
+    # Load Iris
+    iris = datasets.load_iris()
+    X = iris.data  # shape (150, 4)
+    y = iris.target  # shape (150,)
+
+    # Train/test split
+    X_train, X_test, y_train_raw, y_test_raw = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    # Standardize features
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+
+    # One-hot labels
+    num_classes = len(np.unique(y))
+    y_train = one_hot(y_train_raw, num_classes)
+    y_test = one_hot(y_test_raw, num_classes)
+
+    # Build MLP: [4 -> 16 -> ReLU -> 8 -> ReLU -> 3 -> Softmax]
+    layers = [
+        ("dense1", Dense(in_units=4, out_units=16, weight_scale=np.sqrt(2 / 4))),  # He init scale-ish
+        ("relu1", ReLU),
+        ("dense2", Dense(in_units=16, out_units=8, weight_scale=np.sqrt(2 / 16))),
+        ("relu2", ReLU),
+        ("dense3", Dense(in_units=8, out_units=num_classes, weight_scale=0.01)),
+        ("softmax", Softmax)
+    ]
+    model = MLP(layers)
+
+    # Train
+    train(
+        model=model,
+        X_train=X_train,
+        y_train=y_train,
+        X_val=X_test,
+        y_val=y_test,
+        epochs=200,
+        lr=0.1,
+        batch_size=16,
+        verbose=True
+    )
+
+    # Final evaluation
+    probs_test = model.forward(X_test)
+    preds_test = np.argmax(probs_test, axis=1)
+    acc_test = accuracy(preds_test, y_test_raw)
+    print("\nFinal Test Accuracy: {:.4f}".format(acc_test))
+    print("Predicted labels:", preds_test)
+    print("True labels:     ", y_test_raw)
+
+
+if __name__ == "__main__":
+    main()
